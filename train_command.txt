@@ -1,0 +1,1 @@
+torchrun --standalone --nproc_per_node=2 --master_port 29501 main_finetune.py --model V3_DeiT_Hybrid_l --data_path /force02/datasets/imagenet --output_dir ./outputs/V3_DeiT_Hybrid_run1 --log_dir ./outputs/V3_DeiT_Hybrid_run1 --batch_size 64 --epochs 200 --blr 6e-4 --warmup_epochs 10 --teacher_model regnety_160 --lambda_dist 0.5
