@@ -31,6 +31,18 @@ torchrun   main_finetune.py \
 
 ```
 
+### convert
+
+convert:
+
+```shell
+python convert_checkpoint.py \
+    --source_path /path/to/your/original_v3_checkpoint.pth \
+    --dest_path /path/to/save/converted_hybrid_checkpoint.pth \
+    --model_name V3_DeiT_Hybrid_l
+
+```
+
 
 
 ### Data Prepare
