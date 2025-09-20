@@ -17,6 +17,7 @@ import os
 import time
 from pathlib import Path
 import importlib
+import inspect
 
 import torch
 from util.samplers import RASampler
@@ -286,7 +287,7 @@ def get_args_parser():
         "--dist_url", default="env://", help="url used to set up distributed training"
     )
 
-    # --- 新增: 知识蒸馏相关参数 ---
+    # --- 新增: 基于响应的蒸馏相关参数 ---
     parser.add_argument('--teacher_model', default='regnety_160', type=str,
                         help='Name of teacher model to train (default: regnety_160)')
     parser.add_argument('--teacher_path', default='', type=str,
@@ -295,6 +296,18 @@ def get_args_parser():
                         help='type of distillation')
     parser.add_argument('--lambda_dist', default=0.5, type=float,
                         help="weight of distillation loss")
+    
+    # --- 新增: 基于特征的蒸馏相关参数 ---
+    parser.add_argument('--ta_model_module', default='', type=str,
+                    help='Python module path of TA model, e.g. models_spike_v3')
+    parser.add_argument('--ta_model_cls', default='', type=str,
+                    help='Class name of TA model, e.g. SpikeV3_170M')
+    parser.add_argument('--ta_path', default='', type=str,
+                    help='Path to TA pretrained checkpoint (.pth)')
+    parser.add_argument('--feat_kd_layers', default='conv2_2,stage3_3,stage4_last', type=str,
+                    help='Comma-separated tap names to distill (must match your hook names)')
+    parser.add_argument('--feat_kd_w', default=0.5, type=float,
+                    help='Weight of feature-level KD loss')
 
 
     return parser
@@ -405,6 +418,41 @@ def main(args):
         teacher_model.to(device)
         teacher_model.eval()
 
+    # 加载助教模型
+    ta_model = None
+    if getattr(args, 'ta_model_module', '') and getattr(args, 'ta_model_cls', ''):
+       import importlib
+       ta_mod = importlib.import_module(args.ta_model_module)   # e.g. models_spike_v3
+       TaClass = getattr(ta_mod, args.ta_model_cls)             # e.g. SpikeV3_170M
+       #ta_model = TaClass(num_classes=args.nb_classes)          # 按你的实现补充必要init参数 
+       obj = getattr(ta_mod, args.ta_model_cls)  # 可能是类，也可能是工厂函数
+       if inspect.isclass(obj):
+         # 直接是类（如 Spikformer）
+          ta_model = obj(num_classes=args.nb_classes)
+       else:
+         # 是工厂函数（如 spikformer12_768）
+          sig = inspect.signature(obj)
+          if 'num_classes' in sig.parameters:
+             ta_model = obj(num_classes=args.nb_classes)
+          else:
+             ta_model = obj()
+
+       if args.ta_path:
+          ckpt = torch.load(args.ta_path, map_location='cpu')
+          state = ckpt.get('model', ckpt.get('state_dict', ckpt))
+          # 去掉可能的 'module.' 前缀
+          from collections import OrderedDict
+          new_state = OrderedDict((k.replace('module.', ''), v) for k,v in state.items())
+          ta_model.load_state_dict(new_state, strict=False)
+          
+       for p in ta_model.parameters():
+          p.requires_grad = False
+       ta_model.eval()
+       # 显存紧张建议放 CPU（强烈推荐）；显存充足可放 GPU 或 half 到 GPU
+       ta_model.to(device)           # 放到与学生同一张 GPU
+       #ta_model.half()               # 半精度（需 AMP 支持）
+
+
     model.T = args.time_steps
     if args.finetune:
         checkpoint = torch.load(args.finetune, map_location="cpu")
@@ -434,7 +482,82 @@ def main(args):
             model, device_ids=[args.gpu], find_unused_parameters=True
         )
         model_without_ddp = model.module
+    
+    # ========= 在“创建优化器之前”做：注册 hooks + 构建投影头 =========
+    stu_feats, ta_feats = {}, {}
+    def _hook(bag, name):
+     def fn(_m, _i, o):
+        # 如果 TA 输出是 5D (B,C,T,H,W)，这里先把时间维 T 压掉
+        if isinstance(o, torch.Tensor) and o.dim() == 5:
+            o = o.mean(dim=2)  # 平均时间维 → (B,C,H,W)
+        bag[name] = o
+     return fn
+    
+    # 学生模型：在底层 module 上注册（避免 AttributeError）
+    model_without_ddp.ConvBlock2_2[0].register_forward_hook(_hook(stu_feats, 'conv2_2'))
+    model_without_ddp.stage3_blocks[3].register_forward_hook(_hook(stu_feats, 'stage3_3'))
+    model_without_ddp.stage4_blocks[-1].register_forward_hook(_hook(stu_feats, 'stage4_last'))
+    
+    # 助教模型（你放在 CPU），保持原样
+    if ta_model is not None:
+        ta_model.ConvBlock2_2[0].register_forward_hook(_hook(ta_feats, 'conv2_2'))
+        ta_model.block3[3].register_forward_hook(_hook(ta_feats, 'stage3_3'))
+        ta_model.block3[-1].register_forward_hook(_hook(ta_feats, 'stage4_last'))
+    
+    # 探测一次获取中间层尺寸
+    import torch.nn as nn
+    feat_layers = [x.strip() for x in args.feat_kd_layers.split(',') if x.strip()]
+    proj_heads_2d = nn.ModuleDict()
+    proj_heads_1d = nn.ModuleDict()
+    
+    samples_probe, _ = next(iter(data_loader_train))
+    samples_probe = samples_probe.to(device, non_blocking=True)
+    with torch.no_grad():
+        if ta_model is not None:
+            _ = ta_model(samples_probe.cpu() if next(ta_model.parameters()).device.type=='cpu' else samples_probe)
+        _ = model(samples_probe)  # 用 DDP 外壳前向，hooks 仍会触发到底层
+        
+        def _to_tokens(x: torch.Tensor) -> torch.Tensor:
+        # 统一到 (B, N, C)
+         if x.dim() == 5:
+            # (B,C,T,H,W) 或 (T,B,C,H,W) —— 先压时间维
+            if x.shape[2] >= 2 and x.shape[0] in (1, samples_probe.shape[0]):
+                x = x.mean(dim=2)                 # (B,C,H,W)
+            else:
+                x = x.mean(dim=0)                 # (B,C,H,W)
+         if x.dim() == 4:
+            # (T,B,C,N) 或 (B,C,H,W)
+            if x.shape[0] <= 4 and x.shape[-1] >= 49 and int(x.shape[-1] ** 0.5) ** 2 == x.shape[-1]:
+                x = x.mean(dim=0) if x.shape[0] > 1 else x.squeeze(0)   # (B,C,N)
+                x = x.permute(0, 2, 1)                                   # (B,N,C)
+                return x
+            else:
+                B, C, H, W = x.shape
+                x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)           # (B,N,C)
+                return x
+         elif x.dim() == 3:
+            # (B,C,N) -> (B,N,C)
+            if x.shape[1] < x.shape[2]:
+                x = x.permute(0, 2, 1)
+            return x
+         else:
+            raise RuntimeError(f"Unexpected feature shape: {tuple(x.shape)}")
 
+    for name in feat_layers:
+        s = _to_tokens(stu_feats[name])    # (B,Ns,Cs)
+        t = _to_tokens(ta_feats[name])     # (B,Nt,Ct)
+        Cs, Ct = s.shape[-1], t.shape[-1]
+        # 统一走 1D 线性投影（token 维度已对齐到 (B,N,·)）
+        proj_heads_1d[name] = nn.Linear(Cs, Ct, bias=False).to(device)
+
+
+# 把投影头挂在底层模型，确保参数进入 optimizer
+    model_without_ddp.add_module('feat_kd_proj2d', proj_heads_2d)
+    model_without_ddp.add_module('feat_kd_proj1d', proj_heads_1d)
+
+     # ========= 到此为止，再去“构建 optimizer” =========
+            
+     
     # build optimizer with layer-wise lr decay (lrd)
     param_groups = lrd.param_groups_lrd(
         model_without_ddp,
@@ -474,6 +597,9 @@ def main(args):
             f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
         )
         exit(0)
+    
+
+
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -490,6 +616,10 @@ def main(args):
             teacher_model,
             args.lambda_dist,
             #--------------------
+            # ------- 新增：TA特征蒸馏所需 -------
+            ta_model, stu_feats, ta_feats,
+            feat_layers, model_without_ddp.feat_kd_proj2d, model_without_ddp.feat_kd_proj1d, args.feat_kd_w,
+            # -----------------------------------
             data_loader_train,
             optimizer,
             device,

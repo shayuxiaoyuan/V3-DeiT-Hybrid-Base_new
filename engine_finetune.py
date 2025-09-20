@@ -21,6 +21,7 @@ from timm.utils import accuracy
 import util.misc as misc
 import util.lr_sched as lr_sched
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 
 # 修改 train_one_epoch 的函数定义
@@ -31,11 +32,20 @@ def train_one_epoch(
         teacher_model: torch.nn.Module,
         lambda_dist: float,
         #------------
-        data_loader: Iterable,
-        optimizer: torch.optim.Optimizer,
-        device: torch.device,
-        epoch: int,
-        loss_scaler,
+        # 新增：特征蒸馏（有默认值，保持兼容）
+        ta_model: Optional[torch.nn.Module] = None,
+        stu_feats: Optional[dict] = None,
+        ta_feats: Optional[dict] = None,
+        feat_layers: Optional[list] = None,
+        proj_heads_2d: Optional[torch.nn.Module] = None,   # nn.ModuleDict
+        proj_heads_1d: Optional[torch.nn.Module] = None,   # nn.ModuleDict
+        feat_kd_w: float = 0.0,
+        #------------
+        data_loader: Iterable = None,
+        optimizer: torch.optim.Optimizer = None,
+        device: torch.device = None,
+        epoch: int = 0,
+        loss_scaler = None,
         max_norm: Optional[float] = None,
         mixup_fn: Optional[Mixup] = None,
         log_writer: Optional[SummaryWriter] = None,
@@ -76,6 +86,114 @@ def train_one_epoch(
             # 调用在main函数中定义的损失函数
             # 其接收 (原始输入, 模型输出, 真实标签)
             loss = criterion(samples, outputs, targets)
+            # ====== Feature-level KD from TA (REPLACE THIS WHOLE BLOCK) ======
+            if ta_model is not None and feat_kd_w > 0:
+    # 1) 只做 TA 的前向，触发 hooks；TA 在 CPU 就把输入搬到 CPU
+              with torch.no_grad():
+                ta_dev = next(ta_model.parameters()).device
+                ta_inp = samples.to(ta_dev, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=True):
+                    _ = ta_model(ta_inp)
+    # ---- 辅助函数：把 5D 特征压时间维，统一到 4D/3D ----
+              def _squeeze_time(x: torch.Tensor) -> torch.Tensor:
+                if torch.is_tensor(x) and x.dim() == 5:
+            # 兼容 (B,C,T,H,W) 与 (T,B,C,H,W) 两种约定
+            # 经验：你们之前 TA 在 conv2_2 的形状像 (B,C,T,H,W)
+                  if x.shape[2] >= 2 and x.shape[0] in (1, samples.shape[0]):
+                     return x.mean(dim=2)      # (B,C,H,W)
+                  else:
+                    return x.mean(dim=0)      # (B,C,H,W)
+                return x
+              def _to_tokens(x: torch.Tensor) -> torch.Tensor:
+                  # 统一为 (B,N,C)
+                  if x.dim() == 5:
+                      x = _squeeze_time(x)                        # -> (B,C,H,W)
+                  if x.dim() == 4:
+                      # (T,B,C,N) or (B,C,H,W)
+                      if x.shape[0] <= 4 and x.shape[-1] >= 49 and int(x.shape[-1]**0.5)**2 == x.shape[-1]:
+                          x = x.mean(dim=0) if x.shape[0] > 1 else x.squeeze(0)   # (B,C,N)
+                          x = x.permute(0,2,1)                                     # (B,N,C)
+                          return x
+                      else:
+                          B,C,H,W = x.shape
+                          x = x.permute(0,2,3,1).reshape(B, H*W, C)               # (B,N,C)
+                          return x
+                  if x.dim() == 3:
+                      # (B,C,N) -> (B,N,C)
+                      if x.shape[1] < x.shape[2]:
+                          x = x.permute(0,2,1)
+                      return x
+                  raise RuntimeError(f"Unexpected feat dim: {tuple(x.shape)}")
+
+              def _drop_special_tokens(feat: torch.Tensor) -> torch.Tensor:
+                  # (B,N,C)：常见 786/788 = 784 + 2 (cls,dist)
+                  N = feat.shape[1]
+                  if N in (197, 198, 785, 786, 788):
+                      return feat[:, 2:, :]
+                  return feat
+
+              def _pool_to(feat: torch.Tensor, target_N: int) -> torch.Tensor:
+                  # (B,N,C) -> (B,target_N,C)，优先 28x28 -> 14x14 的 2x2 平均池化
+                  B, N, C = feat.shape
+                  if N == target_N:
+                      return feat
+                  S = int((N) ** 0.5)
+                  T = int((target_N) ** 0.5)
+                  if S*S == N and T*T == target_N and S % T == 0:
+                      k = S // T
+                      x = feat.view(B, S, S, C).permute(0,3,1,2)         # (B,C,S,S)
+                      x = F.avg_pool2d(x, kernel_size=k, stride=k)       # (B,C,T,T)
+                      x = x.permute(0,2,3,1).reshape(B, target_N, C)     # (B,target_N,C)
+                      return x
+                  # 兜底：截断
+                  return feat[:, :target_N, :]
+
+              feat_loss = 0.0
+              for name in (feat_layers or []):
+                s = None if stu_feats is None else stu_feats.get(name, None)
+                t = None if ta_feats  is None else ta_feats.get(name, None)
+                if s is None or t is None:
+                  continue
+
+        # 2) 压时间维 & 设备/数据类型对齐
+                s = _squeeze_time(s)
+                t = _squeeze_time(t).to(s.device, dtype=s.dtype)
+
+                if s.dim() == 4 and t.dim() == 4:
+            # ---- BCHW 分支：通道映射 + 空间对齐 + 池化成向量 ----
+                  if (proj_heads_2d is not None) and (name in proj_heads_2d):
+                    s = proj_heads_2d[name](s)  # (B,Ct,H,W)
+                  if s.shape[2:] != t.shape[2:]:
+                    t = F.adaptive_avg_pool2d(t, output_size=s.shape[2:])
+                  s_vec = s.mean(dim=(2, 3))     # (B,C)
+                  t_vec = t.mean(dim=(2, 3))     # (B,C)
+
+                elif s.dim() in (3,4,5) or t.dim() in (3,4,5):
+            # ---- 统一到 (B,N,C)：去特殊 token + 2x2 池化对齐 + 通道映射 ----
+                  s = _to_tokens(s)
+                  t = _to_tokens(t)
+                  s = _drop_special_tokens(s)
+                  # 对齐 token 数（例如 784 -> 196）
+                  s = _pool_to(s, target_N=t.shape[1])
+                  if (proj_heads_1d is not None) and (name in proj_heads_1d):
+                      s = proj_heads_1d[name](s)  # (B, Nt, Ct)
+                  # 按 token 取均值得到 (B,C) 再算损失（也可改为逐 token MSE）
+                  s_vec = s.mean(dim=1)          # (B, Ct)
+                  t_vec = t.mean(dim=1)          # (B, Ct)
+
+
+                else:
+            # 其他维度形状不支持，跳过该层
+                 continue
+
+        # 3) 通道交集上计算 MSE（稳妥）
+                C = min(s_vec.shape[1], t_vec.shape[1])
+                feat_loss = feat_loss + F.mse_loss(s_vec[:, :C], t_vec[:, :C], reduction='mean')
+
+    # 4) 并入总损失
+              loss = loss + feat_kd_w * feat_loss
+# ====== END Feature-level KD ======
+
 
             outputs_acc = outputs[0]
 
