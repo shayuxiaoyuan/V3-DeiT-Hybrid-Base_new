@@ -235,6 +235,7 @@ def get_args_parser():
         type=int,
         help="number of the classification types",
     )
+    
 
     parser.add_argument(
         "--output_dir",
@@ -276,6 +277,9 @@ def get_args_parser():
     )
     parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
     parser.set_defaults(pin_mem=True)
+
+    
+
 
     # distributed training parameters
     parser.add_argument(
@@ -330,6 +334,8 @@ def main(args):
 
     dataset_train = build_dataset(is_train=True, args=args)
     dataset_val = build_dataset(is_train=False, args=args)
+    
+    
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -503,6 +509,7 @@ def main(args):
         ta_model.ConvBlock2_2[0].register_forward_hook(_hook(ta_feats, 'conv2_2'))
         ta_model.block3[3].register_forward_hook(_hook(ta_feats, 'stage3_3'))
         ta_model.block3[-1].register_forward_hook(_hook(ta_feats, 'stage4_last'))
+
     
     # 探测一次获取中间层尺寸
     import torch.nn as nn
@@ -517,6 +524,12 @@ def main(args):
             _ = ta_model(samples_probe.cpu() if next(ta_model.parameters()).device.type=='cpu' else samples_probe)
         _ = model(samples_probe)  # 用 DDP 外壳前向，hooks 仍会触发到底层
         
+        for n in ['conv2_2','stage3_3','stage4_last','penultimate']:
+         s = stu_feats.get(n, None)
+         t = ta_feats.get(n, None) if ta_model is not None else None
+         print(f"[probe] {n} | student: {None if s is None else tuple(s.shape)} "
+              f"| teacher: {None if (t is None) else tuple(t.shape)}")
+
         def _to_tokens(x: torch.Tensor) -> torch.Tensor:
         # 统一到 (B, N, C)
          if x.dim() == 5:
